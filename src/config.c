@@ -30,6 +30,7 @@
 
 #include "redis.h"
 #include "cluster.h"
+#include "extra.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -540,6 +541,11 @@ void loadServerConfigFromString(char *config) {
                 err = sentinelHandleConfiguration(argv+1,argc-1);
                 if (err) goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"extra-port") && argc == 2) {
+            rextra.port = atoi(argv[1]);
+            if (rextra.port < 0 || rextra.port > 65535) {
+                err = "Invalid extra port"; goto loaderr;
+            }
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
@@ -967,6 +973,14 @@ void configSetCommand(redisClient *c) {
         if (getLongLongFromObject(o,&ll) == REDIS_ERR ||
             ll < 0) goto badfmt;
         server.cluster_slave_validity_factor = ll;
+    } else if (!strcasecmp(c->argv[2]->ptr,"extra-port")) {
+        if (getLongLongFromObject(o,&ll) == REDIS_ERR ||
+            ll < 0 || ll > 65535) goto badfmt;
+        if (rextra.enabled) {
+            addReplyErrorFormat(c,"Extra thread is running.");
+            return;
+        }
+        rextra.port = (int)ll;
     } else {
         addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
             (char*)c->argv[2]->ptr);
@@ -1075,6 +1089,7 @@ void configGetCommand(redisClient *c) {
     config_get_numerical_field("cluster-migration-barrier",server.cluster_migration_barrier);
     config_get_numerical_field("cluster-slave-validity-factor",server.cluster_slave_validity_factor);
     config_get_numerical_field("repl-diskless-sync-delay",server.repl_diskless_sync_delay);
+    config_get_numerical_field("extra-port",rextra.port);
 
     /* Bool (yes/no) values */
     config_get_bool_field("cluster-require-full-coverage",
@@ -1871,6 +1886,7 @@ int rewriteConfig(char *path) {
     rewriteConfigNumericalOption(state,"hz",server.hz,REDIS_DEFAULT_HZ);
     rewriteConfigYesNoOption(state,"aof-rewrite-incremental-fsync",server.aof_rewrite_incremental_fsync,REDIS_DEFAULT_AOF_REWRITE_INCREMENTAL_FSYNC);
     rewriteConfigYesNoOption(state,"aof-load-truncated",server.aof_load_truncated,REDIS_DEFAULT_AOF_LOAD_TRUNCATED);
+    rewriteConfigNumericalOption(state,"extra-port",rextra.port,REDIS_EXTRAPORT);
     if (server.sentinel_mode) rewriteConfigSentinelOption(state);
 
     /* Step 3: remove all the orphaned lines in the old file, that is, lines

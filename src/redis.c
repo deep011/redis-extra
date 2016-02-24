@@ -32,6 +32,7 @@
 #include "slowlog.h"
 #include "bio.h"
 #include "latency.h"
+#include "extra.h"
 
 #include <time.h>
 #include <signal.h>
@@ -283,7 +284,8 @@ struct redisCommand redisCommandTable[] = {
     {"pfcount",pfcountCommand,-2,"r",0,NULL,1,-1,1,0,0},
     {"pfmerge",pfmergeCommand,-2,"wm",0,NULL,1,-1,1,0,0},
     {"pfdebug",pfdebugCommand,-3,"w",0,NULL,0,0,0,0,0},
-    {"latency",latencyCommand,-2,"arslt",0,NULL,0,0,0,0,0}
+    {"latency",latencyCommand,-2,"arslt",0,NULL,0,0,0,0,0},
+    {"extra",extraCommand,-2,"arslt",0,NULL,0,0,0,0,0}
 };
 
 struct evictionPoolEntry *evictionPoolAlloc(void);
@@ -3603,6 +3605,7 @@ int main(int argc, char **argv) {
     dictSetHashFunctionSeed(tv.tv_sec^tv.tv_usec^getpid());
     server.sentinel_mode = checkForSentinelMode(argc,argv);
     initServerConfig();
+    initExtraConfig();
 
     /* We need to init sentinel right now as parsing the configuration file
      * in sentinel mode will have the effect of populating the sentinel
@@ -3693,6 +3696,7 @@ int main(int argc, char **argv) {
             redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
         if (server.sofd > 0)
             redisLog(REDIS_NOTICE,"The server is now ready to accept connections at %s", server.unixsocket);
+        if (rextra.port > 0) extraThreadInit();
     } else {
         sentinelIsRunning();
     }

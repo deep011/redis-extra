@@ -72,6 +72,7 @@ typedef long long mstime_t; /* millisecond time type. */
 #define REDIS_MIN_HZ            1
 #define REDIS_MAX_HZ            500
 #define REDIS_SERVERPORT        6379    /* TCP port */
+#define REDIS_EXTRAPORT         0       /* extra TCP port */
 #define REDIS_TCP_BACKLOG       511     /* TCP listen backlog */
 #define REDIS_MAXIDLETIME       0       /* default client timeout: infinite */
 #define REDIS_DEFAULT_DBNUM     16
@@ -1012,6 +1013,7 @@ typedef struct {
  *----------------------------------------------------------------------------*/
 
 extern struct redisServer server;
+extern struct redisExtra rextra;
 extern struct sharedObjectsStruct shared;
 extern dictType setDictType;
 extern dictType zsetDictType;
