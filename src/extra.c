@@ -1883,6 +1883,13 @@ void extraCommand(redisClient *c) {
 
         extraThreadKill();
         addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"status") && c->argc == 2) {
+        sds s = sdscatfmt(sdsempty(),
+            "%s %i",
+            rextra.enabled?"enabled":"disabled",
+            rextra.port);
+        addReplyBulkCString(c,s);
+        sdsfree(s);
     } else {
         addReply(c,shared.syntaxerr);
     }
