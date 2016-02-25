@@ -6,6 +6,7 @@
 redisExtra rextra;
 
 static void pingExtraCommand(redisClient *c);
+static void clientExtraCommand(redisClient *c);
 static void readQueryFromExtraClient(aeEventLoop *el, int fd, void *privdata, int mask);
 static void addExtraReplyString(redisClient *c, char *s, size_t len);
 static void addExtraReplyErrorLength(redisClient *c, char *s, size_t len);
@@ -15,12 +16,14 @@ static void addExtraReplyBulkLen(redisClient *c, robj *obj);
 static void addExtraReplyBulk(redisClient *c, robj *obj);
 static void addExtraReplyBulkCBuffer(redisClient *c, void *p, size_t len);
 static void addExtraReplyLongLongWithPrefix(redisClient *c, long long ll, char prefix);
+static void addExtraReplyLongLong(redisClient *c, long long ll);
 #ifdef __GNUC__
 static void addExtraReplyErrorFormat(redisClient *c, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 #else
 static void addExtraReplyErrorFormat(redisClient *c, const char *fmt, ...);
 #endif
+static void freeExtraClient(redisClient *c);
 
 static unsigned int dictSdsCaseHash(const void *key) {
     return dictGenCaseHashFunction((unsigned char*)key, sdslen((char*)key));
@@ -106,8 +109,135 @@ static dictType commandTableDictType = {
  *    are not fast commands.
  */
 struct redisCommand redisExtraCommandTable[] = {
-    {"ping",pingExtraCommand,-1,"rtF",0,NULL,0,0,0,0,0}
+    {"ping",pingExtraCommand,-1,"rtF",0,NULL,0,0,0,0,0},
+    {"client",clientExtraCommand,-2,"rs",0,NULL,0,0,0,0,0},
 };
+
+static int getLongLongFromObjectOrExtraReply(redisClient *c, robj *o, long long *target, const char *msg) {
+    long long value;
+    if (getLongLongFromObject(o, &value) != REDIS_OK) {
+        if (msg != NULL) {
+            addExtraReplyError(c,(char*)msg);
+        } else {
+            addExtraReplyError(c,"value is not an integer or out of range");
+        }
+        return REDIS_ERR;
+    }
+    *target = value;
+    return REDIS_OK;
+}
+
+/* A Redis "Peer ID" is a colon separated ip:port pair.
+ * For IPv4 it's in the form x.y.z.k:port, example: "127.0.0.1:1234".
+ * For IPv6 addresses we use [] around the IP part, like in "[::1]:1234".
+ * For Unix sockets we use path:0, like in "/tmp/redis:0".
+ *
+ * A Peer ID always fits inside a buffer of REDIS_PEER_ID_LEN bytes, including
+ * the null term.
+ *
+ * The function returns REDIS_OK on succcess, and REDIS_ERR on failure.
+ *
+ * On failure the function still populates 'peerid' with the "?:0" string
+ * in case you want to relax error checking or need to display something
+ * anyway (see anetPeerToString implementation for more info). */
+int genExtraClientPeerId(redisClient *client, char *peerid, size_t peerid_len) {
+    char ip[REDIS_IP_STR_LEN];
+    int port;
+
+    if (client->flags & REDIS_UNIX_SOCKET) {
+        /* Unix socket client. */
+        snprintf(peerid,peerid_len,"%s","NOTSUPPORT");
+        return REDIS_OK;
+    } else {
+        /* TCP client. */
+        int retval = anetPeerToString(client->fd,ip,sizeof(ip),&port);
+        formatPeerId(peerid,peerid_len,ip,port);
+        return (retval == -1) ? REDIS_ERR : REDIS_OK;
+    }
+}
+
+/* This function returns the client peer id, by creating and caching it
+ * if client->peerid is NULL, otherwise returning the cached value.
+ * The Peer ID never changes during the life of the client, however it
+ * is expensive to compute. */
+static char *getExtraClientPeerId(redisClient *c) {
+    char peerid[REDIS_PEER_ID_LEN];
+
+    if (c->peerid == NULL) {
+        genExtraClientPeerId(c,peerid,sizeof(peerid));
+        c->peerid = sdsnew(peerid);
+    }
+    return c->peerid;
+}
+
+/* Concatenate a string representing the state of a client in an human
+ * readable format, into the sds string 's'. */
+static sds catExtraClientInfoString(sds s, redisClient *client) {
+    char flags[16], events[3], *p;
+    int emask;
+
+    p = flags;
+    if (client->flags & REDIS_SLAVE) {
+        if (client->flags & REDIS_MONITOR)
+            *p++ = 'O';
+        else
+            *p++ = 'S';
+    }
+    if (client->flags & REDIS_MASTER) *p++ = 'M';
+    if (client->flags & REDIS_MULTI) *p++ = 'x';
+    if (client->flags & REDIS_BLOCKED) *p++ = 'b';
+    if (client->flags & REDIS_DIRTY_CAS) *p++ = 'd';
+    if (client->flags & REDIS_CLOSE_AFTER_REPLY) *p++ = 'c';
+    if (client->flags & REDIS_UNBLOCKED) *p++ = 'u';
+    if (client->flags & REDIS_CLOSE_ASAP) *p++ = 'A';
+    if (client->flags & REDIS_UNIX_SOCKET) *p++ = 'U';
+    if (client->flags & REDIS_READONLY) *p++ = 'r';
+    if (p == flags) *p++ = 'N';
+    *p++ = '\0';
+
+    emask = client->fd == -1 ? 0 : aeGetFileEvents(rextra.el,client->fd);
+    p = events;
+    if (emask & AE_READABLE) *p++ = 'r';
+    if (emask & AE_WRITABLE) *p++ = 'w';
+    *p = '\0';
+    return sdscatfmt(s,
+        "id=%U addr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i multi=%i qbuf=%U qbuf-free=%U obl=%U oll=%U omem=%U events=%s cmd=%s",
+        (unsigned long long) client->id,
+        getExtraClientPeerId(client),
+        client->fd,
+        client->name ? (char*)client->name->ptr : "",
+        (long long)(rextra.unixtime - client->ctime),
+        (long long)(rextra.unixtime - client->lastinteraction),
+        flags,
+        client->db?client->db->id:-1,
+        (int) dictSize(client->pubsub_channels),
+        (int) listLength(client->pubsub_patterns),
+        (client->flags & REDIS_MULTI) ? client->mstate.count : -1,
+        (unsigned long long) sdslen(client->querybuf),
+        (unsigned long long) sdsavail(client->querybuf),
+        (unsigned long long) client->bufpos,
+        (unsigned long long) listLength(client->reply),
+        (unsigned long long) getClientOutputBufferMemoryUsage(client),
+        events,
+        client->lastcmd ? client->lastcmd->name : "NULL");
+}
+
+static sds getAllExtraClientsInfoString(void) {
+    listNode *ln;
+    listIter li;
+    redisClient *client;
+    sds o = sdsempty();
+
+    o = sdsMakeRoomFor(o,200*listLength(rextra.clients));
+    listRewind(rextra.clients,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        client = listNodeValue(ln);
+        o = catExtraClientInfoString(o,client);
+        o = sdscatlen(o,"\n",1);
+    }
+
+    return o;
+}
 
 /* The PING command. */
 static void pingExtraCommand(redisClient *c) {
@@ -130,6 +260,147 @@ static void pingExtraCommand(redisClient *c) {
             addExtraReply(c,shared.pong);
         else
             addExtraReplyBulk(c,c->argv[1]);
+    }
+}
+
+static void clientExtraCommand(redisClient *c) {
+    listNode *ln;
+    listIter li;
+    redisClient *client;
+
+    if (!strcasecmp(c->argv[1]->ptr,"list") && c->argc == 2) {
+        /* CLIENT LIST */
+        sds o = getAllExtraClientsInfoString();
+        addExtraReplyBulkCBuffer(c,o,sdslen(o));
+        sdsfree(o);
+    } else if (!strcasecmp(c->argv[1]->ptr,"kill")) {
+        /* CLIENT KILL <ip:port>
+         * CLIENT KILL <option> [value] ... <option> [value] */
+        char *addr = NULL;
+        int type = -1;
+        uint64_t id = 0;
+        int skipme = 1;
+        int killed = 0, close_this_client = 0;
+
+        if (c->argc == 3) {
+            /* Old style syntax: CLIENT KILL <addr> */
+            addr = c->argv[2]->ptr;
+            skipme = 0; /* With the old form, you can kill yourself. */
+        } else if (c->argc > 3) {
+            int i = 2; /* Next option index. */
+
+            /* New style syntax: parse options. */
+            while(i < c->argc) {
+                int moreargs = c->argc > i+1;
+
+                if (!strcasecmp(c->argv[i]->ptr,"id") && moreargs) {
+                    long long tmp;
+
+                    if (getLongLongFromObjectOrExtraReply(c,c->argv[i+1],&tmp,NULL)
+                        != REDIS_OK) return;
+                    id = tmp;
+                } else if (!strcasecmp(c->argv[i]->ptr,"type") && moreargs) {
+                    type = getClientTypeByName(c->argv[i+1]->ptr);
+                    if (type == -1) {
+                        addExtraReplyErrorFormat(c,"Unknown client type '%s'",
+                            (char*) c->argv[i+1]->ptr);
+                        return;
+                    }
+                } else if (!strcasecmp(c->argv[i]->ptr,"addr") && moreargs) {
+                    addr = c->argv[i+1]->ptr;
+                } else if (!strcasecmp(c->argv[i]->ptr,"skipme") && moreargs) {
+                    if (!strcasecmp(c->argv[i+1]->ptr,"yes")) {
+                        skipme = 1;
+                    } else if (!strcasecmp(c->argv[i+1]->ptr,"no")) {
+                        skipme = 0;
+                    } else {
+                        addExtraReply(c,shared.syntaxerr);
+                        return;
+                    }
+                } else {
+                    addExtraReply(c,shared.syntaxerr);
+                    return;
+                }
+                i += 2;
+            }
+        } else {
+            addExtraReply(c,shared.syntaxerr);
+            return;
+        }
+
+        if (c->argc == 4 && !strcasecmp(c->argv[2]->ptr,"id") && id == 0) {
+            addExtraReplyLongLong(c,0);
+            return;
+        }
+
+        /* Iterate clients killing all the matching clients. */
+        listRewind(rextra.clients,&li);
+        while ((ln = listNext(&li)) != NULL) {
+            client = listNodeValue(ln);
+            if (addr && strcmp(getExtraClientPeerId(client),addr) != 0) continue;
+            if (type != -1 &&
+                (client->flags & REDIS_MASTER ||
+                 getClientType(client) != type)) continue;
+            if (id != 0 && client->id != id) continue;
+            if (c == client && skipme) continue;
+
+            /* Kill it. */
+            if (c == client) {
+                close_this_client = 1;
+            } else {
+                freeExtraClient(client);
+            }
+            killed++;
+        }
+
+        /* Reply according to old/new format. */
+        if (c->argc == 3) {
+            if (killed == 0)
+                addExtraReplyError(c,"No such client");
+            else
+                addExtraReply(c,shared.ok);
+        } else {
+            addExtraReplyLongLong(c,killed);
+        }
+
+        /* If this client has to be closed, flag it as CLOSE_AFTER_REPLY
+         * only after we queued the reply to its output buffers. */
+        if (close_this_client) c->flags |= REDIS_CLOSE_AFTER_REPLY;
+    } else if (!strcasecmp(c->argv[1]->ptr,"setname") && c->argc == 3) {
+        int j, len = sdslen(c->argv[2]->ptr);
+        char *p = c->argv[2]->ptr;
+
+        /* Setting the client name to an empty string actually removes
+         * the current name. */
+        if (len == 0) {
+            if (c->name) decrRefCount(c->name);
+            c->name = NULL;
+            addExtraReply(c,shared.ok);
+            return;
+        }
+
+        /* Otherwise check if the charset is ok. We need to do this otherwise
+         * CLIENT LIST format will break. You should always be able to
+         * split by space to get the different fields. */
+        for (j = 0; j < len; j++) {
+            if (p[j] < '!' || p[j] > '~') { /* ASCII is assumed. */
+                addExtraReplyError(c,
+                    "Client names cannot contain spaces, "
+                    "newlines or special characters.");
+                return;
+            }
+        }
+        if (c->name) decrRefCount(c->name);
+        c->name = c->argv[2];
+        incrRefCount(c->name);
+        addExtraReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"getname") && c->argc == 2) {
+        if (c->name)
+            addExtraReplyBulk(c,c->name);
+        else
+            addExtraReply(c,shared.nullbulk);
+    } else {
+        addExtraReplyError(c, "Syntax error, try CLIENT (LIST | KILL ip:port | GETNAME | SETNAME connection-name)");
     }
 }
 
@@ -277,14 +548,14 @@ static void freeExtraClient(redisClient *c) {
     }
     listRelease(c->reply);
     freeExtraClientArgv(c);
-    redisLog(REDIS_WARNING,"@@1");
+
     /* Remove from the list of clients */
     if (c->fd != -1) {
         ln = listSearchKey(rextra.clients,c);
         redisAssert(ln != NULL);
         listDelNode(rextra.clients,ln);
     }
-    redisLog(REDIS_WARNING,"@@2");
+
     /* If this client was scheduled for async freeing we need to remove it
      * from the queue. */
     if (c->flags & REDIS_CLOSE_ASAP) {
@@ -292,17 +563,17 @@ static void freeExtraClient(redisClient *c) {
         redisAssert(ln != NULL);
         listDelNode(rextra.clients_to_close,ln);
     }
-    redisLog(REDIS_WARNING,"@@3");
+
     /* Release other dynamically allocated client structure fields,
      * and finally release the client structure itself. */
     if (c->name) decrRefCount(c->name);
     zfree(c->argv);
-    redisLog(REDIS_WARNING,"@@4");
+
     freeClientMultiState(c);
     sdsfree(c->peerid);
-    redisLog(REDIS_WARNING,"@@5");
+
     zfree(c);
-    redisLog(REDIS_WARNING,"@@6");
+
 }
 
 /* Schedule a client to free it at a safe time in the extraCron() function.
@@ -700,6 +971,15 @@ static void addExtraReplyLongLongWithPrefix(redisClient *c, long long ll, char p
     buf[len+1] = '\r';
     buf[len+2] = '\n';
     addExtraReplyString(c,buf,len+3);
+}
+
+static void addExtraReplyLongLong(redisClient *c, long long ll) {
+    if (ll == 0)
+        addExtraReply(c,shared.czero);
+    else if (ll == 1)
+        addExtraReply(c,shared.cone);
+    else
+        addExtraReplyLongLongWithPrefix(c,ll,':');
 }
 
 /* Create the length prefix of a bulk reply, example: $2234 */
@@ -1245,17 +1525,18 @@ static void populateExtraCommandTable(void) {
 }
 
 void initExtraConfig(void) {
+    int i;
+    
     rextra.thread = 0;
     rextra.enabled = 0;
-    rextra.next_client_id = 0;
+    rextra.next_client_id = 1;  /* Client IDs, start from 1 .*/
     rextra.el = NULL;
     rextra.hz = 0;
     rextra.port = 0;
     rextra.efd_count = 0;
     rextra.neterr[0] = '\0';
     rextra.unixtime = 0;
-    rextra.commands = NULL;
-    //rextra.client_obuf_limits;
+    rextra.commands = NULL;    
     rextra.tcpkeepalive = 0;
     rextra.client_max_querybuf_len = 0;
     rextra.maxclients = 0;
@@ -1266,6 +1547,11 @@ void initExtraConfig(void) {
     rextra.stat_numconnections = 0;
     rextra.stat_net_input_bytes = 0;
     rextra.stat_net_output_bytes = 0;
+
+    for (i = 0; i < REDIS_CLIENT_TYPE_COUNT; i ++) {
+        rextra.client_obuf_limits[i].hard_limit_bytes = 0;
+        rextra.client_obuf_limits[i].soft_limit_bytes = 0;
+    }
 }
 
 int initExtra(void){
@@ -1371,7 +1657,7 @@ int extraThreadInit(void) {
     rextra.thread = thread;
     rextra.enabled = 1;
 
-    redisLog(REDIS_NOTICE, "Extra thread exited.");
+    redisLog(REDIS_NOTICE, "Extra thread started.");
     return REDIS_OK;
 }
 
@@ -1390,7 +1676,7 @@ int extraThreadKill(void) {
     
     deinitExtra();
     rextra.enabled = 0;
-    redisLog(REDIS_NOTICE, "Extra thread started.");
+    redisLog(REDIS_NOTICE, "Extra thread exited.");
     return REDIS_OK;
 }
 
