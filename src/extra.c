@@ -7,8 +7,10 @@ redisExtra rextra;
 
 static void pingExtraCommand(redisClient *c);
 static void clientExtraCommand(redisClient *c);
+static void infoExtraCommand(redisClient *c);
 static void readQueryFromExtraClient(aeEventLoop *el, int fd, void *privdata, int mask);
 static void addExtraReplyString(redisClient *c, char *s, size_t len);
+static void addExtraReplySds(redisClient *c, sds s);
 static void addExtraReplyErrorLength(redisClient *c, char *s, size_t len);
 static void addExtraReplyError(redisClient *c, char *err);
 static void addExtraReply(redisClient *c, robj *obj);
@@ -111,6 +113,7 @@ static dictType commandTableDictType = {
 struct redisCommand redisExtraCommandTable[] = {
     {"ping",pingExtraCommand,-1,"rtF",0,NULL,0,0,0,0,0},
     {"client",clientExtraCommand,-2,"rs",0,NULL,0,0,0,0,0},
+    {"info",infoExtraCommand,-1,"rlt",0,NULL,0,0,0,0,0}
 };
 
 static int getLongLongFromObjectOrExtraReply(redisClient *c, robj *o, long long *target, const char *msg) {
@@ -402,6 +405,103 @@ static void clientExtraCommand(redisClient *c) {
     } else {
         addExtraReplyError(c, "Syntax error, try CLIENT (LIST | KILL ip:port | GETNAME | SETNAME connection-name)");
     }
+}
+
+/* Create the string returned by the INFO command. This is decoupled
+ * by the INFO command itself as we need to report the same information
+ * on memory corruption problems. */
+static sds genExtraInfoString(char *section) {
+    sds info = sdsempty();
+    time_t uptime = rextra.unixtime-rextra.stat_starttime;
+    int j, numcommands;
+    int allsections = 0, defsections = 0;
+    int sections = 0;
+
+    if (section == NULL) section = "default";
+    allsections = strcasecmp(section,"all") == 0;
+    defsections = strcasecmp(section,"default") == 0;
+
+    /* Extra */
+    if (allsections || defsections || !strcasecmp(section,"extra")) {
+        if (sections++) info = sdscat(info,"\r\n");
+
+        info = sdscatprintf(info,
+            "# Extra\r\n"
+            "thread_id:%lu\r\n"
+            "tcp_port:%d\r\n"
+            "uptime_in_seconds:%jd\r\n"
+            "uptime_in_days:%jd\r\n"
+            "tcpkeepalive:%d\r\n"
+            "hz:%d\r\n",
+            rextra.thread,
+            rextra.port,
+            (intmax_t)uptime,
+            (intmax_t)(uptime/(3600*24)),
+            rextra.tcpkeepalive,
+            rextra.hz);
+    }
+
+    /* Clients */
+    if (allsections || defsections || !strcasecmp(section,"clients")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info,
+            "# Clients\r\n"
+            "max_clients_can_be_accepted:%u\r\n"
+            "client_max_querybuf_len:%zu\r\n"
+            "connected_clients:%lu\r\n",
+            rextra.maxclients,
+            rextra.client_max_querybuf_len,
+            listLength(rextra.clients));
+    }
+
+    /* Stats */
+    if (allsections || defsections || !strcasecmp(section,"stats")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info,
+            "# Stats\r\n"
+            "total_connections_received:%lld\r\n"
+            "total_commands_processed:%lld\r\n"
+            "total_net_input_bytes:%lld\r\n"
+            "total_net_output_bytes:%lld\r\n"
+            "rejected_connections:%lld\r\n",
+            rextra.stat_numconnections,
+            rextra.stat_numcommands,
+            rextra.stat_net_input_bytes,
+            rextra.stat_net_output_bytes,
+            rextra.stat_rejected_conn);
+    }
+
+    /* cmdtime */
+    if (allsections || !strcasecmp(section,"commandstats")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Commandstats\r\n");
+        numcommands = sizeof(redisExtraCommandTable)/sizeof(struct redisCommand);
+        for (j = 0; j < numcommands; j++) {
+            struct redisCommand *c = redisExtraCommandTable+j;
+
+            if (!c->calls) continue;
+            info = sdscatprintf(info,
+                "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f\r\n",
+                c->name, c->calls, c->microseconds,
+                (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
+        }
+    }
+
+    return info;
+}
+
+static void infoExtraCommand(redisClient *c) {
+    char *section = c->argc == 2 ? c->argv[1]->ptr : "default";
+
+    if (c->argc > 2) {
+        addExtraReply(c,shared.syntaxerr);
+        return;
+    }
+    sds info = genExtraInfoString(section);
+    addExtraReplySds(c,sdscatprintf(sdsempty(),"$%lu\r\n",
+        (unsigned long)sdslen(info)));
+    addExtraReplySds(c,info);
+    addExtraReply(c,shared.crlf);
 }
 
 static int listMatchObjects(void *a, void *b) {
@@ -881,6 +981,53 @@ static void addExtraReplyString(redisClient *c, char *s, size_t len) {
         _addExtraReplyStringToList(c,s,len);
 }
 
+/* This method takes responsibility over the sds. When it is no longer
+ * needed it will be free'd, otherwise it ends up in a robj. */
+static void _addExtraReplySdsToList(redisClient *c, sds s) {
+    robj *tail;
+
+    if (c->flags & REDIS_CLOSE_AFTER_REPLY) {
+        sdsfree(s);
+        return;
+    }
+
+    if (listLength(c->reply) == 0) {
+        listAddNodeTail(c->reply,createObject(REDIS_STRING,s));
+        c->reply_bytes += zmalloc_size_sds(s);
+    } else {
+        tail = listNodeValue(listLast(c->reply));
+
+        /* Append to this object when possible. */
+        if (tail->ptr != NULL && tail->encoding == REDIS_ENCODING_RAW &&
+            sdslen(tail->ptr)+sdslen(s) <= REDIS_REPLY_CHUNK_BYTES)
+        {
+            c->reply_bytes -= zmalloc_size_sds(tail->ptr);
+            tail = dupLastObjectIfNeeded(c->reply);
+            tail->ptr = sdscatlen(tail->ptr,s,sdslen(s));
+            c->reply_bytes += zmalloc_size_sds(tail->ptr);
+            sdsfree(s);
+        } else {
+            listAddNodeTail(c->reply,createObject(REDIS_STRING,s));
+            c->reply_bytes += zmalloc_size_sds(s);
+        }
+    }
+    asyncCloseExtraClientOnOutputBufferLimitReached(c);
+}
+
+static void addExtraReplySds(redisClient *c, sds s) {
+    if (prepareExtraClientToWrite(c) != REDIS_OK) {
+        /* The caller expects the sds to be free'd. */
+        sdsfree(s);
+        return;
+    }
+    if (_addExtraReplyToBuffer(c,s,sdslen(s)) == REDIS_OK) {
+        sdsfree(s);
+    } else {
+        /* This method free's the sds when it is no longer needed. */
+        _addExtraReplySdsToList(c,s);
+    }
+}
+
 static void addExtraReplyErrorLength(redisClient *c, char *s, size_t len) {
     addExtraReplyString(c,"-ERR ",5);
     addExtraReplyString(c,s,len);
@@ -1253,6 +1400,8 @@ static void extraCall(redisClient *c, int flags) {
      * recursively. */
     c->flags &= ~(REDIS_FORCE_AOF|REDIS_FORCE_REPL);
     c->flags |= client_old_flags & (REDIS_FORCE_AOF|REDIS_FORCE_REPL);
+
+    rextra.stat_numcommands ++;
 }
 
 
@@ -1529,6 +1678,7 @@ void initExtraConfig(void) {
     
     rextra.thread = 0;
     rextra.enabled = 0;
+    rextra.stat_starttime = 0;
     rextra.next_client_id = 1;  /* Client IDs, start from 1 .*/
     rextra.el = NULL;
     rextra.hz = 0;
@@ -1547,6 +1697,7 @@ void initExtraConfig(void) {
     rextra.stat_numconnections = 0;
     rextra.stat_net_input_bytes = 0;
     rextra.stat_net_output_bytes = 0;
+    rextra.stat_numcommands = 0;
 
     for (i = 0; i < REDIS_CLIENT_TYPE_COUNT; i ++) {
         rextra.client_obuf_limits[i].hard_limit_bytes = 0;
@@ -1556,6 +1707,13 @@ void initExtraConfig(void) {
 
 int initExtra(void){
 
+    rextra.stat_starttime = time(NULL);
+    rextra.stat_numconnections = 0;
+    rextra.stat_net_input_bytes = 0;
+    rextra.stat_net_output_bytes = 0;
+    rextra.stat_rejected_conn = 0;
+    rextra.stat_numcommands = 0;
+    
     rextra.client_max_querybuf_len = 512;
     rextra.maxclients = 100;
     rextra.tcpkeepalive = 120;

@@ -20,10 +20,12 @@ typedef struct redisExtra {
     redisClient *current_client;        /* Current client, only used on crash report */
     list *clients;                      /* List of active clients */
     list *clients_to_close;             /* Clients to close asynchronously */
+    time_t stat_starttime;              /* Extra start time */
     long long stat_rejected_conn;       /* Clients rejected because of maxclients */
     long long stat_numconnections;      /* Number of connections received */
     long long stat_net_input_bytes;     /* Bytes read from network. */
     long long stat_net_output_bytes;    /* Bytes written to network. */
+    long long stat_numcommands;         /* Number of processed commands */
 }redisExtra;
 
 void initExtraConfig(void);
