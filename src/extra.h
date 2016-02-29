@@ -37,4 +37,12 @@ int extraThreadInit(void);
 
 void extraCommand(redisClient *c);
 
+int clusterExtraLinkCreate(clusterNode *node);
+clusterLink *createClusterExtraLink(clusterNode *node);
+void freeClusterExtraLink(clusterLink *link);
+
+void clusterSendExtraPing(clusterLink *link);
+
+void clusterSendExtraPingForClusterIoErr(clusterNode *node);
+
 #endif /* __REDIS_EXTRA_H */

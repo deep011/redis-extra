@@ -101,7 +101,11 @@ typedef struct clusterNode {
     long long repl_offset;      /* Last known repl offset for this node. */
     char ip[REDIS_IP_STR_LEN];  /* Latest known IP address of this node */
     int port;                   /* Latest known port of this node */
+    int extra_port;             /* Latest known extra port of this node */
     clusterLink *link;          /* TCP/IP link with this node */
+    clusterLink *extra_link;    /* TCP/IP link with this node for extra if needed */
+    mstime_t extra_ping_sent;      /* Unix time we sent latest extra ping */
+    mstime_t extra_pong_received;  /* Unix time we received the extra pong */
     list *fail_reports;         /* List of nodes signaling this as failing */
 } clusterNode;
 
@@ -239,6 +243,7 @@ typedef struct {
     char slaveof[REDIS_CLUSTER_NAMELEN];
     char notused1[32];  /* 32 bytes reserved for future usage. */
     uint16_t port;      /* Sender TCP base port */
+    uint16_t extra_port;/* Sender EXTRA TCP base port */
     uint16_t flags;     /* Sender node flags */
     unsigned char state; /* Cluster state from the POV of the sender */
     unsigned char mflags[3]; /* Message flags: CLUSTERMSG_FLAG[012]_... */

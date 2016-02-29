@@ -1,5 +1,6 @@
 
 #include "redis.h"
+#include "cluster.h"
 #include "extra.h"
 #include "endianconv.h"
 
@@ -1636,6 +1637,9 @@ static int extraCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     return 1000/rextra.hz;
 }
 
+/*********************** The follow function call by main thread ***********************/
+
+void clusterSendMessage(clusterLink *link, unsigned char *msg, size_t msglen);
 
 /* Populates the Redis Command Table starting from the hard coded list
  * we have on top of redis.c file. */
@@ -1842,6 +1846,7 @@ int extraThreadKill(void) {
  *
  * EXTRA RUN: run the extra thread.
  * EXTRA STOP: stop the extra thread.
+ * EXTRA STATUS: show the extra thread status.
  */
 void extraCommand(redisClient *c) {
     int port, old_port;
@@ -1890,9 +1895,171 @@ void extraCommand(redisClient *c) {
             rextra.port);
         addReplyBulkCString(c,s);
         sdsfree(s);
+    } else if (!strcasecmp(c->argv[1]->ptr,"testmainsleep") && c->argc == 3) {
+        int sec;
+        sec = atoi(c->argv[2]->ptr);
+        sleep(sec);
+        addReply(c,shared.ok);
     } else {
         addReply(c,shared.syntaxerr);
     }
 }
 
+/* This function is called when we detect the link with this node is lost.
+   We set the node as no longer connected. The Cluster Cron will detect
+   this connection and will try to get it connected again.
+
+   Instead if the node is a temporary node used to accept a query, we
+   completely free the node on error. */
+static void handleExtraLinkIOError(clusterLink *link) {
+    freeClusterExtraLink(link);
+}
+
+/* Read data. Try to read the first field of the header first to check the
+ * full length of the packet. When a whole packet is in memory this function
+ * will call the function to process the packet. And so forth. */
+static void extraClusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    char buf[10];
+    ssize_t nread;
+    clusterLink *link = (clusterLink*) privdata;
+    unsigned int readlen, rcvbuflen;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
+
+    while(1) { /* Read as long as there is data to read. */
+        rcvbuflen = sdslen(link->rcvbuf);
+        if (rcvbuflen < 7) {
+            /* First, obtain the first 8 bytes to get the full message
+             * length. */
+            readlen = 7 - rcvbuflen;
+        } else {
+            server.cluster->stats_bus_messages_received++;
+            
+            if (memcmp(link->rcvbuf, "+PONG\r\n", 7) != 0) {
+                redisLog(REDIS_WARNING,
+                    "Bad message length or signature received "
+                    "from Extra bus.");
+                handleExtraLinkIOError(link);
+                return;
+            }
+            
+            redisLog(REDIS_NOTICE,"cluster received extra message from node %.40s: %.5s", 
+                link->node->name, link->rcvbuf);
+            link->node->extra_pong_received = mstime();
+            link->node->extra_ping_sent = 0;
+
+            if (rcvbuflen == 7) {
+                sdsfree(link->rcvbuf);
+                link->rcvbuf = sdsempty();
+                readlen = 7;
+            } else {
+                sdsrange(link->rcvbuf, 7, -1);
+                rcvbuflen -= 7;
+                continue;
+            }   
+        }
+
+        nread = read(fd,buf,readlen);
+        if (nread == -1 && errno == EAGAIN) return; /* No more data ready. */
+
+        if (nread <= 0) {
+            /* I/O error... */
+            redisLog(REDIS_DEBUG,"I/O error reading from node extra link: %s",
+                (nread == 0) ? "connection closed" : strerror(errno));
+            handleExtraLinkIOError(link);
+            return;
+        } else {
+            /* Read data and recast the pointer to the new buffer. */
+            link->rcvbuf = sdscatlen(link->rcvbuf,buf,nread);
+        }
+    }
+}
+
+int clusterExtraLinkCreate(clusterNode *node) {
+    int fd;
+    clusterLink *link;
+    mstime_t old_ping_sent;
+
+    if (node->extra_link || !node->extra_port) {
+        return REDIS_OK;    
+    }
+
+    fd = anetTcpNonBlockBindConnect(server.neterr, node->ip,
+        node->extra_port, REDIS_BIND_ADDR);
+    if (fd == -1) {
+        redisLog(REDIS_DEBUG, "Unable to connect to "
+            "Cluster Node [%s]:%d -> %s", node->ip,
+            node->extra_port, server.neterr);
+        return REDIS_ERR;
+    }
+    
+    link = createClusterExtraLink(node);
+    link->fd = fd;
+    node->extra_link = link;
+    aeCreateFileEvent(server.el,link->fd,AE_READABLE,
+            extraClusterReadHandler,link);
+    /* Queue a PING in the new connection ASAP: this is crucial
+     * to avoid false positives in failure detection. 
+     *
+     * If the node is flagged as MEET, we send a MEET message instead
+     * of a PING one, to force the receiver to add us in its node
+     * table. */
+    old_ping_sent = node->extra_ping_sent;
+    clusterSendExtraPing(link);
+    if (old_ping_sent) {
+        /* If there was an active ping before the link was
+         * disconnected, we want to restore the ping time, otherwise
+         * replaced by the clusterSendPing() call. */
+        node->extra_ping_sent = old_ping_sent;
+    }
+
+    redisLog(REDIS_DEBUG,"Connecting with Node %.40s for extra thread at %s:%d",
+            node->name, node->ip, node->extra_port);
+
+    return REDIS_OK;
+}
+
+clusterLink *createClusterExtraLink(clusterNode *node) {
+    clusterLink *link = zmalloc(sizeof(*link));
+    link->ctime = mstime();
+    link->sndbuf = sdsempty();
+    link->rcvbuf = sdsempty();
+    link->node = node;
+    link->fd = -1;
+    return link;
+}
+
+/* Free a cluster extra link, but does not free the associated node of course.
+ * This function will just make sure that the original node associated
+ * with this link will have the 'extra_link' field set to NULL. */
+void freeClusterExtraLink(clusterLink *link) {
+    if (link->fd != -1) {
+        aeDeleteFileEvent(server.el, link->fd, AE_WRITABLE);
+        aeDeleteFileEvent(server.el, link->fd, AE_READABLE);
+    }
+    sdsfree(link->sndbuf);
+    sdsfree(link->rcvbuf);
+    if (link->node)
+        link->node->extra_link = NULL;
+    close(link->fd);
+    zfree(link);
+}
+
+/* Send a PING packet to the specified node int the cluster for extra thread. */
+void clusterSendExtraPing(clusterLink *link) {
+    clusterSendMessage(link,(unsigned char *)"ping\r\n",6);
+    link->node->extra_ping_sent = mstime();
+}
+
+void clusterSendExtraPingForClusterIoErr(clusterNode *node) {
+    if (node && node->extra_port) {
+        if (node->extra_link) {
+            clusterSendExtraPing(node->extra_link);
+        } else {
+            clusterExtraLinkCreate(node);
+        }
+    }
+}
+
+/*********************** End main thread ***********************/
 

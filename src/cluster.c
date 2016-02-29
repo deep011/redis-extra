@@ -31,6 +31,7 @@
 #include "redis.h"
 #include "cluster.h"
 #include "endianconv.h"
+#include "extra.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -667,8 +668,11 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->ping_sent = node->pong_received = 0;
     node->fail_time = 0;
     node->link = NULL;
+    node->extra_link = NULL;
+    node->extra_ping_sent = node->extra_pong_received = 0;
     memset(node->ip,0,sizeof(node->ip));
     node->port = 0;
+    node->extra_port = 0;
     node->fail_reports = listCreate();
     node->voted_time = 0;
     node->orphaned_time = 0;
@@ -834,6 +838,7 @@ void freeClusterNode(clusterNode *n) {
 
     /* Release link and associated data structures. */
     if (n->link) freeClusterLink(n->link);
+    if (n->extra_link) freeClusterLink(n->extra_link);
     listRelease(n->fail_reports);
     zfree(n->slaves);
     zfree(n);
@@ -1661,6 +1666,7 @@ int clusterProcessPacket(clusterLink *link) {
             node = createClusterNode(NULL,REDIS_NODE_HANDSHAKE);
             nodeIp2String(node->ip,link);
             node->port = ntohs(hdr->port);
+            node->extra_port = ntohs(hdr->extra_port);
             clusterAddNode(node);
             clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
         }
@@ -1871,6 +1877,9 @@ int clusterProcessPacket(clusterLink *link) {
 
         /* Get info from the gossip section */
         if (sender) clusterProcessGossipSection(hdr,link);
+
+        /* Update the extra_port */
+        if (sender) sender->extra_port = ntohs(hdr->extra_port);
     } else if (type == CLUSTERMSG_TYPE_FAIL) {
         clusterNode *failing;
 
@@ -1992,6 +2001,7 @@ void clusterWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     if (nwritten <= 0) {
         redisLog(REDIS_DEBUG,"I/O error writing to node link: %s",
             strerror(errno));
+        clusterSendExtraPingForClusterIoErr(link->node);
         handleLinkIOError(link);
         return;
     }
@@ -2045,6 +2055,7 @@ void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             /* I/O error... */
             redisLog(REDIS_DEBUG,"I/O error reading from node link: %s",
                 (nread == 0) ? "connection closed" : strerror(errno));
+            clusterSendExtraPingForClusterIoErr(link->node);
             handleLinkIOError(link);
             return;
         } else {
@@ -2130,6 +2141,7 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
     if (myself->slaveof != NULL)
         memcpy(hdr->slaveof,myself->slaveof->name, REDIS_CLUSTER_NAMELEN);
     hdr->port = htons(server.port);
+    hdr->extra_port = htons(rextra.enabled?rextra.port:0);
     hdr->flags = htons(myself->flags);
     hdr->state = server.cluster->state;
 
@@ -3093,6 +3105,8 @@ void clusterCron(void) {
             fd = anetTcpNonBlockBindConnect(server.neterr, node->ip,
                 node->port+REDIS_CLUSTER_PORT_INCR, REDIS_BIND_ADDR);
             if (fd == -1) {
+                clusterSendExtraPingForClusterIoErr(node);
+                
                 /* We got a synchronous error from connect before
                  * clusterSendPing() had a chance to be called.
                  * If node->ping_sent is zero, failure detection can't work,
@@ -3134,6 +3148,15 @@ void clusterCron(void) {
 
             redisLog(REDIS_DEBUG,"Connecting with Node %.40s at %s:%d",
                     node->name, node->ip, node->port+REDIS_CLUSTER_PORT_INCR);
+        }
+
+        if (!node->extra_port) {
+            if (node->extra_link != NULL)
+                freeClusterExtraLink(node->extra_link);
+            if (node->extra_ping_sent)
+                node->extra_ping_sent = 0;
+            if (node->extra_pong_received)
+                node->extra_pong_received = 0;
         }
     }
     dictReleaseIterator(di);
@@ -3201,6 +3224,18 @@ void clusterCron(void) {
                 this_slaves = okslaves;
         }
 
+        if (node->extra_port &&
+            node->extra_link && 
+            now - node->extra_link->ctime >
+            server.cluster_node_timeout && /* was not already reconnected */
+            node->extra_ping_sent && /* we already sent a ping */
+            node->extra_pong_received < node->extra_ping_sent && /* still waiting pong */
+            /* and we are waiting for the pong more than timeout/2 */
+            now - node->extra_ping_sent > server.cluster_node_timeout/3) {
+            /* Disconnect the link, it will be reconnected automatically. */
+            freeClusterExtraLink(node->extra_link);
+        }
+
         /* If we are waiting for the PONG more than half the cluster
          * timeout, reconnect the link: maybe there is a connection
          * issue even if the node is alive. */
@@ -3214,6 +3249,14 @@ void clusterCron(void) {
         {
             /* Disconnect the link, it will be reconnected automatically. */
             freeClusterLink(node->link);
+
+            if (node->extra_port) {
+                if (node->extra_link) {
+                    clusterSendExtraPing(node->extra_link);
+                } else {
+                    clusterExtraLinkCreate(node);
+                }
+            }
         }
 
         /* If we have currently no active ping in this instance, and the
@@ -3241,6 +3284,15 @@ void clusterCron(void) {
 
         /* Check only if we have an active ping for this instance. */
         if (node->ping_sent == 0) continue;
+
+        
+        if (node->extra_port) {
+            if (node->extra_ping_sent == 0)    
+                continue;
+            else if (now - node->extra_ping_sent <=
+                server.cluster_node_timeout)
+                continue;
+        }
 
         /* Compute the delay of the PONG. Note that if we already received
          * the PONG, then node->ping_sent is zero, so can't reach this
