@@ -1,18 +1,18 @@
-#改造的初衷
+# 改造的初衷
 
 众所周知，redis cluster目前版本(3.0.7)会出现胡乱failover的情况，根本原因是由于cluster本身的探测机制和redis单线程的模式造成的。
 
 单线程由于一些'大命令'（flushall，keys，hgetall等）不可避免会产生线程的阻塞，如果某节点阻塞的时间超过了cluster-node-timeout，那么cluster中其他节点会认为该节点出问题，以至于在该节点还活着的情况下产生failover。
 
-#改造的方法
+# 改造的方法
 
-##增加额外线程
+## 增加额外线程
 
 为了避免这个情况的发生，我们给redis增加了一个额外的线程extra thread来监听一个单独的端口extra-port（该端口可以在redis的配置文件中进行配置）。
 
 由于起了额外的线程，即使redis的主线程被'命令'阻塞，这个额外的线程也能正常响应ping请求。
 
-##redis cluster的failover逻辑改造
+## redis cluster的failover逻辑改造
 
 在redis cluster一切正常的情况下，原逻辑不变。
 
@@ -22,9 +22,9 @@
 
 如果extra-port也不响应ping命令，那么其他节点认为该节点真的挂了，立即进行failover。
 
-#使用方法
+# 使用方法
 
-##redis配置文件增加了extra-port配置项
+## redis配置文件增加了extra-port配置项
 
 extra-port配置项默认是0，即不启动extra线程及监听端口。
 
@@ -32,7 +32,7 @@ extra-port配置项默认是0，即不启动extra线程及监听端口。
 
 该配置项可以在redis运行的时候进行更改。
 
-##在主线程增加了extra命令
+## 在主线程增加了extra命令
 
 extra status   查看extra线程的状态。
 
