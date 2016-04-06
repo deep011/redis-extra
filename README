@@ -1,173 +1,43 @@
-Where to find complete Redis documentation?
--------------------------------------------
+#改造的初衷
 
-This README is just a fast "quick start" document. You can find more detailed
-documentation at http://redis.io
+众所周知，redis cluster目前版本(3.0.7)会出现胡乱failover的情况，根本原因是由于cluster本身的探测机制和redis单线程的模式造成的。
 
-Building Redis
---------------
+单线程由于一些'大命令'（flushall，keys，hgetall等）不可避免会产生线程的阻塞，如果某节点阻塞的时间超过了cluster-node-timeout，那么cluster中其他节点会认为该节点出问题，以至于在该节点还活着的情况下产生failover。
 
-Redis can be compiled and used on Linux, OSX, OpenBSD, NetBSD, FreeBSD.
-We support big endian and little endian architectures.
+#改造的方法
 
-It may compile on Solaris derived systems (for instance SmartOS) but our
-support for this platform is "best effort" and Redis is not guaranteed to
-work as well as in Linux, OSX, and *BSD there.
+##增加额外线程
 
-It is as simple as:
+为了避免这个情况的发生，我们给redis增加了一个额外的线程extra thread来监听一个单独的端口extra-port（该端口可以在redis的配置文件中进行配置）。
 
-    % make
+由于起了额外的线程，即使redis的主线程被'命令'阻塞，这个额外的线程也能正常响应ping请求。
 
-You can run a 32 bit Redis binary using:
+##redis cluster的failover逻辑改造
 
-    % make 32bit
+在redis cluster一切正常的情况下，原逻辑不变。
 
-After building Redis is a good idea to test it, using:
+如果cluster中有个节点在cluster-node-timeout/2时间不响应其他节点的ping命令，那么这些节点会去ping该节点的extra线程监听的端口。
 
-    % make test
+此时若extra-port响应了ping命令，那么其他节点认为该节点正常，不进行failover。
 
-Fixing build problems with dependencies or cached build options
-—--------
-Redis has some dependencies which are included into the "deps" directory.
-"make" does not rebuild dependencies automatically, even if something in the
-source code of dependencies is changes.
+如果extra-port也不响应ping命令，那么其他节点认为该节点真的挂了，立即进行failover。
 
-When you update the source code with `git pull` or when code inside the
-dependencies tree is modified in any other way, make sure to use the following
-command in order to really clean everything and rebuild from scratch:
+#使用方法
 
-    make distclean
+##redis配置文件增加了extra-port配置项
 
-This will clean: jemalloc, lua, hiredis, linenoise.
+extra-port配置项默认是0，即不启动extra线程及监听端口。
 
-Also if you force certain build options like 32bit target, no C compiler
-optimizations (for debugging purposes), and other similar build time options,
-those options are cached indefinitely until you issue a "make distclean"
-command.
+当配置文件中extra-port设置大于0时，表示启动extra线程。
 
-Fixing problems building 32 bit binaries
----------
+该配置项可以在redis运行的时候进行更改。
 
-If after building Redis with a 32 bit target you need to rebuild it
-with a 64 bit target, or the other way around, you need to perform a
-"make distclean" in the root directory of the Redis distribution.
+##在主线程增加了extra命令
 
-In case of build errors when trying to build a 32 bit binary of Redis, try
-the following steps:
+extra status   查看extra线程的状态。
 
-* Install the packages libc6-dev-i386 (also try g++-multilib).
-* Try using the following command line instead of "make 32bit":
+extra stop  关闭extra线程及端口。
 
-    make CFLAGS="-m32 -march=native" LDFLAGS="-m32"
-
-Allocator
----------
-
-Selecting a non-default memory allocator when building Redis is done by setting
-the `MALLOC` environment variable. Redis is compiled and linked against libc
-malloc by default, with the exception of jemalloc being the default on Linux
-systems. This default was picked because jemalloc has proven to have fewer
-fragmentation problems than libc malloc.
-
-To force compiling against libc malloc, use:
-
-    % make MALLOC=libc
-
-To compile against jemalloc on Mac OS X systems, use:
-
-    % make MALLOC=jemalloc
-
-Verbose build
--------------
-
-Redis will build with a user friendly colorized output by default.
-If you want to see a more verbose output use the following:
-
-    % make V=1
-
-Running Redis
--------------
-
-To run Redis with the default configuration just type:
-
-    % cd src
-    % ./redis-server
-    
-If you want to provide your redis.conf, you have to run it using an additional
-parameter (the path of the configuration file):
-
-    % cd src
-    % ./redis-server /path/to/redis.conf
-
-It is possible to alter the Redis configuration passing parameters directly
-as options using the command line. Examples:
-
-    % ./redis-server --port 9999 --slaveof 127.0.0.1 6379
-    % ./redis-server /etc/redis/6379.conf --loglevel debug
-
-All the options in redis.conf are also supported as options using the command
-line, with exactly the same name.
-
-Playing with Redis
-------------------
-
-You can use redis-cli to play with Redis. Start a redis-server instance,
-then in another terminal try the following:
-
-    % cd src
-    % ./redis-cli
-    redis> ping
-    PONG
-    redis> set foo bar
-    OK
-    redis> get foo
-    "bar"
-    redis> incr mycounter
-    (integer) 1
-    redis> incr mycounter
-    (integer) 2
-    redis> 
-
-You can find the list of all the available commands here:
-
-    http://redis.io/commands
-
-Installing Redis
------------------
-
-In order to install Redis binaries into /usr/local/bin just use:
-
-    % make install
-
-You can use "make PREFIX=/some/other/directory install" if you wish to use a
-different destination.
-
-Make install will just install binaries in your system, but will not configure
-init scripts and configuration files in the appropriate place. This is not
-needed if you want just to play a bit with Redis, but if you are installing
-it the proper way for a production system, we have a script doing this
-for Ubuntu and Debian systems:
-
-    % cd utils
-    % ./install_server.sh
-
-The script will ask you a few questions and will setup everything you need
-to run Redis properly as a background daemon that will start again on
-system reboots.
-
-You'll be able to stop and start Redis using the script named
-/etc/init.d/redis_<portnumber>, for instance /etc/init.d/redis_6379.
-
-Code contributions
----
-
-Note: by contributing code to the Redis project in any form, including sending
-a pull request via Github, a code fragment or patch via private email or
-public discussion groups, you agree to release your code under the terms
-of the BSD license that you can find in the COPYING file included in the Redis
-source distribution.
-
-Please see the CONTRIBUTING file in this source distribution for more
-information.
-
-Enjoy!
+extra run [extra-port]  开启extra线程及监听端口。
+ 
+extra线程增加了ping命令，info命令，client命令，quit命令
