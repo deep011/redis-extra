@@ -1666,7 +1666,7 @@ int clusterProcessPacket(clusterLink *link) {
             node = createClusterNode(NULL,REDIS_NODE_HANDSHAKE);
             nodeIp2String(node->ip,link);
             node->port = ntohs(hdr->port);
-            node->extra_port = ntohs(hdr->extra_port);
+            node->extra_port = ntohs(hdr->notused0);
             clusterAddNode(node);
             clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
         }
@@ -1879,7 +1879,7 @@ int clusterProcessPacket(clusterLink *link) {
         if (sender) clusterProcessGossipSection(hdr,link);
 
         /* Update the extra_port */
-        if (sender) sender->extra_port = ntohs(hdr->extra_port);
+        if (sender) sender->extra_port = ntohs(hdr->notused0);
     } else if (type == CLUSTERMSG_TYPE_FAIL) {
         clusterNode *failing;
 
@@ -2141,7 +2141,7 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
     if (myself->slaveof != NULL)
         memcpy(hdr->slaveof,myself->slaveof->name, REDIS_CLUSTER_NAMELEN);
     hdr->port = htons(server.port);
-    hdr->extra_port = htons(rextra.enabled?rextra.port:0);
+    hdr->notused0 = htons(rextra.enabled?rextra.port:0);
     hdr->flags = htons(myself->flags);
     hdr->state = server.cluster->state;
 

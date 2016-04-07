@@ -229,7 +229,7 @@ typedef struct {
     char sig[4];        /* Siganture "RCmb" (Redis Cluster message bus). */
     uint32_t totlen;    /* Total length of this message */
     uint16_t ver;       /* Protocol version, currently set to 0. */
-    uint16_t notused0;  /* 2 bytes not used. */
+    uint16_t notused0;  /* 2 bytes not used. Now used for Sender EXTRA TCP base port*/
     uint16_t type;      /* Message type */
     uint16_t count;     /* Only used for some kind of messages. */
     uint64_t currentEpoch;  /* The epoch accordingly to the sending node. */
@@ -243,7 +243,6 @@ typedef struct {
     char slaveof[REDIS_CLUSTER_NAMELEN];
     char notused1[32];  /* 32 bytes reserved for future usage. */
     uint16_t port;      /* Sender TCP base port */
-    uint16_t extra_port;/* Sender EXTRA TCP base port */
     uint16_t flags;     /* Sender node flags */
     unsigned char state; /* Cluster state from the POV of the sender */
     unsigned char mflags[3]; /* Message flags: CLUSTERMSG_FLAG[012]_... */
